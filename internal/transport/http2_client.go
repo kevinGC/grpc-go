@@ -47,6 +47,7 @@ import (
 	istatus "google.golang.org/grpc/internal/status"
 	isyscall "google.golang.org/grpc/internal/syscall"
 	"google.golang.org/grpc/internal/transport/networktype"
+	"google.golang.org/grpc/internal/zerocopy"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/mem"
 	"google.golang.org/grpc/metadata"
@@ -203,7 +204,7 @@ func isTemporary(err error) bool {
 // NewHTTP2Client constructs a connected ClientTransport to addr based on HTTP2
 // and starts to receive messages on it. Non-nil error returns if construction
 // fails.
-func NewHTTP2Client(connectCtx, ctx context.Context, addr resolver.Address, opts ConnectOptions, onClose func(GoAwayReason)) (_ ClientTransport, err error) {
+func NewHTTP2Client(connectCtx, ctx context.Context, addr resolver.Address, opts ConnectOptions, onClose func(GoAwayReason), subchannel *channelz.SubChannel) (_ ClientTransport, err error) {
 	scheme := "http"
 	ctx, cancel := context.WithCancel(ctx)
 	defer func() {
@@ -318,6 +319,16 @@ func NewHTTP2Client(connectCtx, ctx context.Context, addr resolver.Address, opts
 	maxHeaderListSize := defaultClientMaxHeaderListSize
 	if opts.MaxHeaderListSize != nil {
 		maxHeaderListSize = *opts.MaxHeaderListSize
+	}
+
+	// Enable zerocopy when requested.
+	if opts.ZerocopyRX || opts.ZerocopyTX {
+		wrapped, err := zerocopy.FromConn(conn, opts.ZerocopyRX, opts.ZerocopyTX)
+		if err == nil {
+			conn = &wrapped
+		} else {
+			channelz.Warningf(logger, subchannel, "grpc: client failed to wrap TCP connection: %v", err)
+		}
 	}
 
 	t := &http2Client{

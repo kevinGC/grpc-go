@@ -507,6 +507,12 @@ type ConnectOptions struct {
 	BufferPool mem.BufferPool
 	// StaticWindowSize controls whether dynamic window sizing is enabled.
 	StaticWindowSize bool
+	// ZerocopyRX specifies whether TCP zerocopy should be used in the RX
+	// direction.
+	ZerocopyRX bool
+	// ZerocopyTX specifies whether TCP zerocopy should be used in the TX
+	// direction.
+	ZerocopyTX bool
 }
 
 // WriteOptions provides additional hints and information for message

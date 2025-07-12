@@ -119,6 +119,10 @@ var (
 	recvBufferPool        = flags.StringWithAllowedValues("recvBufferPool", recvBufferPoolNil, "Configures the shared receive buffer pool. One of: nil, simple, all", allRecvBufferPools)
 	sharedWriteBuffer     = flags.StringWithAllowedValues("sharedWriteBuffer", toggleModeOff,
 		fmt.Sprintf("Configures both client and server to share write buffer - One of: %v", strings.Join(allToggleModes, ", ")), allToggleModes)
+	clientZerocopy = flags.StringWithAllowedValues("clientZerocopy", zerocopyOff,
+		fmt.Sprintf("Enables client-side TCP zerocopy - One of: %v", strings.Join(allZerocopyModes, ", ")), allZerocopyModes)
+	serverZerocopy = flags.StringWithAllowedValues("serverZerocopy", zerocopyOff,
+		fmt.Sprintf("Enables server-side TCP zerocopy - One of: %v", strings.Join(allZerocopyModes, ", ")), allZerocopyModes)
 
 	logger = grpclog.Component("benchmark")
 )
@@ -143,10 +147,15 @@ const (
 	networkModeLAN   = "LAN"
 	networkModeWAN   = "WAN"
 	networkLongHaul  = "Longhaul"
-	// Shared recv buffer pool
+	// Shared recv buffer pool.
 	recvBufferPoolNil    = "nil"
 	recvBufferPoolSimple = "simple"
 	recvBufferPoolAll    = "all"
+	// Zerocopy modes.
+	zerocopyOff = "off"
+	zerocopyRX  = "rx"
+	zerocopyTX  = "tx"
+	zerocopyAll = "all"
 
 	numStatsBuckets = 10
 	warmupCallCount = 10
@@ -186,6 +195,7 @@ var (
 	allToggleModes            = []string{toggleModeOff, toggleModeOn, toggleModeBoth}
 	allNetworkModes           = []string{networkModeNone, networkModeLocal, networkModeLAN, networkModeWAN, networkLongHaul}
 	allRecvBufferPools        = []string{recvBufferPoolNil, recvBufferPoolSimple, recvBufferPoolAll}
+	allZerocopyModes          = []string{zerocopyOff, zerocopyRX, zerocopyTX, zerocopyAll}
 	defaultReadLatency        = []time.Duration{0, 40 * time.Millisecond} // if non-positive, no delay.
 	defaultReadKbps           = []int{0, 10240}                           // if non-positive, infinite
 	defaultReadMTU            = []int{0}                                  // if non-positive, infinite
@@ -376,6 +386,12 @@ func makeClients(bf stats.Features) ([]testgrpc.BenchmarkServiceClient, func()) 
 	default:
 		logger.Fatalf("Unknown shared recv buffer pool type: %v", bf.RecvBufferPool)
 	}
+
+	// Enable zerocopy on client and server as requested.
+	clientZerocopyRX, clientZerocopyTX := parseZerocopyFlag(*clientZerocopy)
+	opts = append(opts, grpc.WithZerocopy(clientZerocopyRX, clientZerocopyTX))
+	serverZerocopyRX, serverZerocopyTX := parseZerocopyFlag(*serverZerocopy)
+	sopts = append(sopts, grpc.Zerocopy(serverZerocopyRX, serverZerocopyTX))
 
 	sopts = append(sopts, grpc.MaxConcurrentStreams(uint32(bf.MaxConcurrentCalls+1)))
 	opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -919,6 +935,22 @@ func setRecvBufferPool(val string) []string {
 		// be caught during flag.Parse().
 		return []string{}
 	}
+}
+
+func parseZerocopyFlag(val string) (rx, tx bool) {
+	switch val {
+	case zerocopyOff:
+		return false, false
+	case zerocopyRX:
+		return true, false
+	case zerocopyTX:
+		return false, true
+	case zerocopyAll:
+		return true, true
+	default:
+		logger.Fatalf("Unknown zerocopy mode: %s", val)
+	}
+	panic("unreachable")
 }
 
 func main() {

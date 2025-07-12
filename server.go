@@ -46,6 +46,7 @@ import (
 	"google.golang.org/grpc/internal/grpcutil"
 	istats "google.golang.org/grpc/internal/stats"
 	"google.golang.org/grpc/internal/transport"
+	"google.golang.org/grpc/internal/zerocopy"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/mem"
 	"google.golang.org/grpc/metadata"
@@ -53,8 +54,6 @@ import (
 	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/tap"
-
-	_ "google.golang.org/grpc/internal/zerocopy"
 )
 
 const (
@@ -182,6 +181,8 @@ type serverOptions struct {
 	bufferPool            mem.BufferPool
 	waitForHandlers       bool
 	staticWindowSize      bool
+	zerocopyRX            bool
+	zerocopyTX            bool
 }
 
 var defaultServerOptions = serverOptions{
@@ -647,6 +648,19 @@ func bufferPool(bufferPool mem.BufferPool) ServerOption {
 	})
 }
 
+// Zerocopy returns a ServerOption that enables zerocopy RX and/or TX.
+//
+// # Experimental
+//
+// Notice: This API is EXPERIMENTAL and may be changed or removed in a later
+// release.
+func Zerocopy(rx, tx bool) ServerOption {
+	return newFuncServerOption(func(o *serverOptions) {
+		o.zerocopyRX = rx
+		o.zerocopyTX = tx
+	})
+}
+
 // serverWorkerResetThreshold defines how often the stack must be reset. Every
 // N requests, by spawning a new goroutine in its place, a worker can reset its
 // stack so that large stacks don't live in memory forever. 2^16 should allow
@@ -970,6 +984,16 @@ func (s *Server) handleRawConn(lisAddr string, rawConn net.Conn) {
 		return
 	}
 	rawConn.SetDeadline(time.Now().Add(s.opts.connectionTimeout))
+
+	// Enable zerocopy when requested.
+	if s.opts.zerocopyRX || s.opts.zerocopyTX {
+		wrapped, err := zerocopy.FromConn(rawConn, s.opts.zerocopyRX, s.opts.zerocopyTX)
+		if err == nil {
+			rawConn = &wrapped
+		} else {
+			channelz.Warningf(logger, s.channelz, "grpc: server failed to wrap TCP connection: %v", err)
+		}
+	}
 
 	// Finish handshaking (HTTP2)
 	st := s.newHTTP2Transport(rawConn)

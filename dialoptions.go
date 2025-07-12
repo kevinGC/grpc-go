@@ -793,3 +793,16 @@ func withBufferPool(bufferPool mem.BufferPool) DialOption {
 		o.copts.BufferPool = bufferPool
 	})
 }
+
+// WithZerocopy returns a DialOption that enables zerocopy RX and/or TX.
+//
+// # Experimental
+//
+// Notice: This API is EXPERIMENTAL and may be changed or removed in a later
+// release.
+func WithZerocopy(rx, tx bool) DialOption {
+	return newFuncDialOption(func(o *dialOptions) {
+		o.copts.ZerocopyRX = rx
+		o.copts.ZerocopyTX = tx
+	})
+}
