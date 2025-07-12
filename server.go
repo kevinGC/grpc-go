@@ -53,6 +53,8 @@ import (
 	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/tap"
+
+	_ "google.golang.org/grpc/internal/zerocopy"
 )
 
 const (
