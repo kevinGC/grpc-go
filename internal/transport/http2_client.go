@@ -330,6 +330,13 @@ func NewHTTP2Client(connectCtx, ctx context.Context, addr resolver.Address, opts
 			channelz.Warningf(logger, subchannel, "grpc: client failed to wrap TCP connection: %v", err)
 		}
 	}
+	zerocopy.Printf("conn has type %T", conn)
+
+	framer, err := newFramer(conn, writeBufSize, readBufSize, opts.SharedWriteBuffer, maxHeaderListSize)
+	if err != nil {
+		// TODO: They probably want a fancier return type.
+		return nil, fmt.Errorf("failed to initailze zerocopy framer")
+	}
 
 	t := &http2Client{
 		ctx:                   ctx,
@@ -346,7 +353,7 @@ func NewHTTP2Client(connectCtx, ctx context.Context, addr resolver.Address, opts
 		writerDone:            make(chan struct{}),
 		goAway:                make(chan struct{}),
 		keepaliveDone:         make(chan struct{}),
-		framer:                newFramer(conn, writeBufSize, readBufSize, opts.SharedWriteBuffer, maxHeaderListSize),
+		framer:                framer,
 		fc:                    &trInFlow{limit: uint32(icwz)},
 		scheme:                scheme,
 		activeStreams:         make(map[uint32]*ClientStream),
@@ -1694,6 +1701,7 @@ func (t *http2Client) reader(errCh chan<- error) {
 			errClose = connectionErrorf(true, err, "error reading from server: %v", err)
 			return
 		}
+		zerocopy.Printf("frame type: %T", frame)
 		switch frame := frame.(type) {
 		case *http2.MetaHeadersFrame:
 			t.operateHeaders(frame)

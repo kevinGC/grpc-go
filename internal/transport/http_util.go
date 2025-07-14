@@ -37,6 +37,7 @@ import (
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/internal/zerocopy"
 )
 
 const (
@@ -396,12 +397,19 @@ type framer struct {
 var writeBufferPoolMap = make(map[int]*sync.Pool)
 var writeBufferMutex sync.Mutex
 
-func newFramer(conn net.Conn, writeBufferSize, readBufferSize int, sharedWriteBuffer bool, maxHeaderListSize uint32) *framer {
+func newFramer(conn net.Conn, writeBufferSize, readBufferSize int, sharedWriteBuffer bool, maxHeaderListSize uint32) (*framer, error) {
 	if writeBufferSize < 0 {
 		writeBufferSize = 0
 	}
 	var r io.Reader = conn
-	if readBufferSize > 0 {
+	var err error
+	// TODO: Oh, maybe we just need a reader type, not a net.Conn.
+	if zcConn, ok := conn.(*zerocopy.TCPConn); ok {
+		r, err = zerocopy.NewBufferedReader(zcConn, readBufferSize)
+		if err != nil {
+			return nil, err
+		}
+	} else if readBufferSize > 0 {
 		r = bufio.NewReaderSize(r, readBufferSize)
 	}
 	var pool *sync.Pool
@@ -419,7 +427,7 @@ func newFramer(conn net.Conn, writeBufferSize, readBufferSize int, sharedWriteBu
 	f.fr.SetReuseFrames()
 	f.fr.MaxHeaderListSize = maxHeaderListSize
 	f.fr.ReadMetaHeaders = hpack.NewDecoder(http2InitHeaderTableSize, nil)
-	return f
+	return f, nil
 }
 
 func getWriteBufferPool(size int) *sync.Pool {
