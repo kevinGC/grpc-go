@@ -35,6 +35,7 @@ package zerocopy
 import (
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -56,7 +57,7 @@ func Printf(format string, v ...any) {
 
 // rateLimiter prevents logspam.
 var rateLimiter = rate.Sometimes{
-	Interval: time.Minute,
+	Interval: time.Second,
 }
 
 var _ net.Conn = (*TCPConn)(nil)
@@ -158,6 +159,11 @@ type BufferedReader struct {
 func NewBufferedReader(conn *TCPConn, size int) (*BufferedReader, error) {
 	// return bufio.NewReaderSize(conn, size)
 
+	//
+	// PROBLEM: Socket is nonblocking. Do we have to do this read/epoll/read
+	// song and dance?
+	//
+
 	// We manage 2 buffers: the mmap buffer and the copybuf. We have to be
 	// careful to track which buffer the offset is pointing to. Presumably
 	// the right way to do this is to make a single TCP_ZEROCOPY_RECEIVE
@@ -180,9 +186,11 @@ func NewBufferedReader(conn *TCPConn, size int) (*BufferedReader, error) {
 		return nil, fmt.Errorf("bad mmap: got %d, but expected %d", len(br.mmappedStorage), rounded)
 	}
 	br.mmapped = br.mmappedStorage[:0]
+	log.Printf("mmappedStorage starts at address: %p", &br.mmappedStorage[0])
 
 	br.copybufStorage = make([]byte, 4095)
 	br.copybuf = br.copybufStorage[:0]
+	log.Printf("copybufStorage starts at address: %p", &br.copybufStorage[0])
 
 	return &br, nil
 }
@@ -207,12 +215,14 @@ type tcpZerocopyReceive struct {
 func (br *BufferedReader) Read(dst []byte) (int, error) {
 	// Always return buffered, unread bytes first to avoid making extra
 	// syscalls.
+	// log.Printf("br.Read")
 	n, err := br.readBuffered(dst)
 	if n != 0 || err != nil {
 		return n, err
 	}
 
 	// Perform zerocopy RX.
+	// log.Printf("br.Read: going to call getsockopt")
 	zc := tcpZerocopyReceive{
 		address:        uint64(uintptr(unsafe.Pointer(&br.mmappedStorage[0]))),
 		length:         uint32(len(br.mmappedStorage)),
@@ -229,24 +239,113 @@ func (br *BufferedReader) Read(dst []byte) (int, error) {
 		uintptr(unsafe.Pointer(&zcSize)),
 		0, // Unused
 	)
-	if errno != 0 {
+	if errno != 0 && errno != unix.EINTR {
+		log.Printf("zerocopy errno: %d", errno)
 		return 0, errno // TODO: allocates?
 	}
 
-	// Account for mmapped, copybuf, and skip hint data.
-	br.mmapped = br.mmappedStorage[:zc.length]
-	br.copybuf = br.copybufStorage[:zc.copybufLen]
-	br.skipHint = int(zc.recvSkipHint)
+	// Go creates nonblocking sockets, so getting no data only
+	// indicates EOF after a return from epoll.
+	if n := zc.length + uint32(zc.copybufLen) + zc.recvSkipHint; n != 0 {
+		// Account for mmapped, copybuf, and skip hint data.
+		br.mmapped = br.mmappedStorage[:zc.length]
+		br.copybuf = br.copybufStorage[:zc.copybufLen]
+		br.skipHint = int(zc.recvSkipHint)
+		// log.Printf("br.Read: returning %d from first getsockopt", int(n))
+		// rateLimiter.Do(func() {
+		// 	log.Printf("returning from first getsockopt")
+		// })
+		return br.readBuffered(dst)
+	}
+
+	epfd, err := unix.EpollCreate1(0 /* flags */) // TODO: put in struct, not here
+	if err != nil {
+		panic("create")
+		return 0, fmt.Errorf("zerocopy.BufferedReader epoll_create: %w", err)
+	}
+	defer unix.Close(epfd)
+	ev := unix.EpollEvent{
+		Events: unix.EPOLLIN,
+		// Fd:     br.conn.file.Fd(),
+	}
+	if err := unix.EpollCtl(epfd, unix.EPOLL_CTL_ADD, int(br.conn.file.Fd()), &ev); err != nil {
+		return 0, fmt.Errorf("zerocopy.BufferedReader epoll_ctx: %w", err)
+	}
+
+	for {
+		// log.Printf("br.Read: going to wait")
+		var events [1]unix.EpollEvent // TODO: redundant with ev
+		_, err := unix.EpollWait(epfd, events[:], -1 /* block indefinitely */)
+		if err != nil {
+			if err == unix.EINTR {
+				continue
+			}
+			return 0, fmt.Errorf("zerocopy.BufferedReader epoll_wait: %w", err)
+		}
+		// log.Printf("br.Read: wait returned")
+
+		// Re-initialize zc fields modified by previous getsockopt.
+		zc.length = uint32(len(br.mmappedStorage))
+		zc.copybufLen = int32(len(br.copybufStorage))
+
+		rateLimiter.Do(func() {
+			log.Printf("zc: %+v", zc)
+			log.Printf("address: %x, copybufAddress: %x", zc.address, zc.copybufAddress)
+		})
+
+		_, _, errno := unix.Syscall6(
+			unix.SYS_GETSOCKOPT,
+			br.conn.file.Fd(), // TODO: Store the fd so we don't have to keep calling this?
+			unix.SOL_TCP,
+			unix.TCP_ZEROCOPY_RECEIVE,
+			uintptr(unsafe.Pointer(&zc)),
+			uintptr(unsafe.Pointer(&zcSize)),
+			0, // Unused
+		)
+		// log.Printf("br.Read: getsockopt returned")
+		if errno != 0 {
+			// log.Printf("br.Read: getsockopt returned with an error %d", errno)
+			if errno == unix.EINTR {
+				continue
+			}
+			// log.Printf("zerocopy errno: %d", errno)
+			return 0, errno // TODO: allocates?
+		}
+
+		// epoll only returns when there's data available or the
+		// connection is closed.
+		if n := zc.length + uint32(zc.copybufLen) + zc.recvSkipHint; n == 0 {
+			// log.Printf("br.Read: getsockopt returned that we're done")
+			return 0, io.EOF
+		} else {
+			// log.Printf("br.Read: getsockopt returned that we got %d bytes", n)
+		}
+
+		br.mmapped = br.mmappedStorage[:zc.length]
+		br.copybuf = br.copybufStorage[:zc.copybufLen]
+		br.skipHint = int(zc.recvSkipHint)
+
+		break
+
+		// rateLimiter.Do(func() {
+		// 	// logger.Warningf("zerocopy skip hint set") // TODO:
+		// 	// log how?
+		// 	log.Printf("WARNING: zerocopy mmapped %d bytes, copybuffed %d bytes, and hinted %d bytes",
+		// 		len(br.mmapped), len(br.copybuf), br.skipHint)
+		// })
+	}
 
 	return br.readBuffered(dst)
 }
 
+// TODO: Peek and discard
 // readBuffered returns any data that's already been buffered.
 func (br *BufferedReader) readBuffered(dst []byte) (int, error) {
 	// The mmapped bytes are always first.
 	if len(br.mmapped) > 0 {
 		n := copy(dst, br.mmapped)
 		br.mmapped = br.mmapped[n:]
+		Printf("returning %d mmapped bytes", n)
 		return n, nil
 	}
 
@@ -254,6 +353,7 @@ func (br *BufferedReader) readBuffered(dst []byte) (int, error) {
 	if len(br.copybuf) > 0 {
 		n := copy(dst, br.copybuf)
 		br.copybuf = br.copybuf[n:]
+		Printf("returning %d copybuf bytes", n)
 		return n, nil
 	}
 
@@ -264,14 +364,16 @@ func (br *BufferedReader) readBuffered(dst []byte) (int, error) {
 		rateLimiter.Do(func() {
 			// logger.Warningf("zerocopy skip hint set") // TODO:
 			// log how?
-			log.Printf("zerocopy skip hint set")
+			log.Printf("zerocopy skip hint set to %d", br.skipHint)
 		})
 		toRead := min(len(dst), br.skipHint)
 		n, err := br.conn.Read(dst[:toRead])
 		br.skipHint -= n
+		Printf("returning %d skip hint bytes", n)
 		return n, err
 	}
 
+	Printf("no buffered bytes")
 	return 0, nil
 }
 
