@@ -2,7 +2,7 @@
 
 /*
  *
- * Copyright 2014 gRPC authors.
+ * Copyright 2025 gRPC authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -47,6 +47,15 @@ import (
 	"golang.org/x/time/rate"
 )
 
+// TODO:
+// - This is hard to debug because, like neper and tcp_mmap, it requires getting
+//   both rx and tx 0cp working.
+// - Then we have to ensure both rx and tx are plumbed through, which isn't
+//   always trivial.
+// - We should just test it first. It'll be an annoyingly inolved, but useful.
+//   Can send raw 4k buffers.
+//
+
 var dbg bool = false
 
 func Printf(format string, v ...any) {
@@ -87,6 +96,11 @@ func FromTCPConn(conn *net.TCPConn, rx, tx bool) (TCPConn, error) {
 	if err != nil {
 		return TCPConn{}, fmt.Errorf("failed to get for TCPConn: %v", err)
 	}
+
+	if err := unix.SetsockoptInt(file.Fd(), unix.SOL_SOCKET, unix.SO_ZEROCOPY, 1); err != nil {
+		return TCPConn{}, fmt.Errorf("failed to set SO_ZEROCOPY: %w", err)
+	}
+
 	return TCPConn{
 		TCPConn: conn,
 		file:    file,
@@ -110,6 +124,9 @@ func (cn *TCPConn) Read(b []byte) (n int, err error) {
 	if !cn.rx {
 		return cn.TCPConn.Read(b)
 	}
+	// TODO: Ratelimited warning: you probably don't want to call Read
+	// directly, use the BufferedReader.
+	panic("should never be called; always use BufferedReader")
 	Printf("====================================================================")
 	Printf("reading %d bytes", len(b))
 	if dbg {
@@ -123,7 +140,10 @@ func (cn *TCPConn) Write(b []byte) (n int, err error) {
 	if !cn.tx {
 		return cn.TCPConn.Write(b)
 	}
-	return cn.TCPConn.Write(b)
+
+	// Stopgap: copy b into aligned buffer, then TX 0 cp. Slow, but proves
+	// that RX and TX at least work.
+
 }
 
 // Close implements net.Conn.Close.
